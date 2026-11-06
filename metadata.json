@@ -1,0 +1,6 @@
+{
+  "name": "Projections BB",
+  "description": "NBA-only daily fantasy research tool with real-time 2026-27 season stats, matchups, injuries, and value plays.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
