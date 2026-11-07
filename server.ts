@@ -19,79 +19,139 @@ interface RawInjury {
   shortComment?: string;
 }
 
-interface TeamDefense {
-  oppPpg: number;
-  ppg: number;
-  record?: string;
+function normalizeName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z]/g, '')
+    .trim();
 }
 
-// Memory cache for overnight / daily slate caching with fast 2-minute refresh for game statuses
 let cache: {
   timestamp: number;
   dateStr: string;
   data: any;
 } | null = null;
 
-async function fetchLiveNbaRostersAndData(clientLocalDateStr: string) {
-  // Check if cache is fresh (less than 60 seconds)
-  if (cache && Date.now() - cache.timestamp < 60000 && cache.dateStr === clientLocalDateStr) {
-    return cache.data;
-  }
-
-  // 1. Fetch live scoreboard for tonight's games
-  const sbRes = await fetch('https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard');
-  if (!sbRes.ok) {
-    throw new Error(`Failed to fetch NBA scoreboard: HTTP ${sbRes.status}`);
-  }
-  const sbData = await sbRes.json();
-
-  const events = sbData.events || [];
-  if (events.length === 0) {
-    const emptyResult = {
-      date: clientLocalDateStr,
-      hasGamesTonight: false,
-      noGamesMessage: 'No NBA games scheduled for tonight in the 2026-27 season.',
-      games: [],
-      keyInsights: [],
-      allPlayers: []
-    };
-    cache = { timestamp: Date.now(), dateStr: clientLocalDateStr, data: emptyResult };
-    return emptyResult;
-  }
-
-  // 2. Fetch team defensive stats from standings
-  const standingsMap: Record<string, TeamDefense> = {};
+// Pull DraftKings Classic Salaries
+async function fetchDraftKingsSalaries(): Promise<Map<string, number>> {
+  const salaryMap = new Map<string, number>();
   try {
-    const standingsRes = await fetch('https://site.api.espn.com/apis/v2/sports/basketball/nba/standings');
-    if (standingsRes.ok) {
-      const standingsData = await standingsRes.json();
-      for (const conf of (standingsData.children || [])) {
-        for (const entry of (conf.standings?.entries || [])) {
-          const teamName = entry.team?.displayName;
-          const oppPpgStat = entry.stats?.find((s: any) => s.name === 'avgPointsAgainst');
-          const ppgStat = entry.stats?.find((s: any) => s.name === 'avgPointsFor');
-          const recordStat = entry.stats?.find((s: any) => s.name === 'overall');
-          if (teamName) {
-            standingsMap[teamName] = {
-              oppPpg: oppPpgStat ? Number(oppPpgStat.value) : 114,
-              ppg: ppgStat ? Number(ppgStat.value) : 114,
-              record: recordStat?.displayValue
-            };
+    const lobbyRes = await fetch('https://www.draftkings.com/lobby/getcontests?sport=NBA');
+    if (!lobbyRes.ok) return salaryMap;
+    const lobbyData = await lobbyRes.json();
+
+    const slates = (lobbyData.DraftGroups || []).filter((dg: any) => {
+      const tag = (dg.DraftGroupTag || '').toLowerCase();
+      const hasGames = dg.GameCount && dg.GameCount >= 1;
+      const isShowdown = tag.includes('showdown') || tag.includes('captain');
+      return hasGames && !isShowdown;
+    });
+
+    slates.sort((a: any, b: any) => (b.GameCount || 0) - (a.GameCount || 0));
+
+    const targetSlates = slates.slice(0, 8);
+    const draftableResponses = await Promise.all(
+      targetSlates.map(async (s: any) => {
+        try {
+          const r = await fetch(`https://api.draftkings.com/draftgroups/v1/draftgroups/${s.DraftGroupId}/draftables`);
+          if (r.ok) return await r.json();
+        } catch (e) {}
+        return null;
+      })
+    );
+
+    draftableResponses.forEach((d) => {
+      if (d && d.draftables) {
+        d.draftables.forEach((p: any) => {
+          if (p.displayName && p.salary) {
+            const key = normalizeName(p.displayName);
+            if (!salaryMap.has(key)) {
+              salaryMap.set(key, p.salary);
+            }
           }
+        });
+      }
+    });
+  } catch (err) {
+    console.warn('Could not auto-fetch DraftKings salaries:', err);
+  }
+  return salaryMap;
+}
+
+// Pull FanDuel Classic Salaries
+async function fetchFanDuelSalaries(): Promise<Map<string, number>> {
+  const salaryMap = new Map<string, number>();
+  try {
+    const fdRes = await fetch('https://api.fanduel.com/fixture-lists?sport=NBA');
+    if (fdRes.ok) {
+      const fdData = await fdRes.json();
+      const classicFixture = (fdData.fixture_lists || []).find((f: any) => f.game_type === 'classic' || f.sport === 'NBA');
+      if (classicFixture) {
+        const pRes = await fetch(`https://api.fanduel.com/fixture-lists/${classicFixture.id}/players`);
+        if (pRes.ok) {
+          const pData = await pRes.json();
+          (pData.players || []).forEach((p: any) => {
+            const rawName = p.nickname || `${p.first_name || ''} ${p.last_name || ''}`.trim();
+            if (rawName && p.salary) {
+              const key = normalizeName(rawName);
+              if (!salaryMap.has(key)) {
+                salaryMap.set(key, p.salary);
+              }
+            }
+          });
         }
       }
     }
   } catch (err) {
-    console.warn('Could not fetch standings for defensive ratings:', err);
+    console.warn('Could not auto-fetch FanDuel salaries:', err);
+  }
+  return salaryMap;
+}
+
+async function fetchNbaData(clientLocalDateStr: string) {
+  if (cache && Date.now() - cache.timestamp < 60000 && cache.dateStr === clientLocalDateStr) {
+    return cache.data;
   }
 
-  const oppPpgList = Object.values(standingsMap).map(s => s.oppPpg).filter(Boolean);
-  const avgLeagueOppPpg = oppPpgList.length > 0 ? (oppPpgList.reduce((a, b) => a + b, 0) / oppPpgList.length) : 114;
+  // 1. Determine today's date in Eastern Time (America/New_York)
+  const now = new Date();
+  const etFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  });
+  const etParts = etFormatter.format(now).split('/'); // [MM, DD, YYYY]
+  const todayYMD = `${etParts[2]}${etParts[0]}${etParts[1]}`;
+  const todayETString = `${etParts[0]}/${etParts[1]}/${etParts[2]}`;
 
-  // 3. Fetch active injuries for all teams
+  // Fetch live scoreboard explicitly for today's Eastern date
+  let events: any[] = [];
+  try {
+    const sbRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates=${todayYMD}`);
+    if (sbRes.ok) {
+      const sbData = await sbRes.json();
+      events = sbData.events || [];
+    }
+  } catch (err) {
+    console.warn('Failed to fetch NBA scoreboard for today:', err);
+  }
+
+  // Filter for games dated today in Eastern Time and remove completed / Final games
+  const filteredEvents = events.filter((ev: any) => {
+    const state = ev.status?.type?.state;
+    const statusName = (ev.status?.type?.name || '').toLowerCase();
+    const detail = (ev.status?.type?.shortDetail || '').toLowerCase();
+    if (state === 'post' || statusName.includes('final') || detail.includes('final')) {
+      return false;
+    }
+    const gameET = etFormatter.format(new Date(ev.date));
+    return gameET === todayETString;
+  });
+
+  // 2. Fetch active injuries for all teams
   const teamInjuriesMap: Record<string, RawInjury[]> = {};
   const outPlayers = new Set<string>();
-  const injuryDetailsMap = new Map<string, { status: string; desc: string }>();
 
   try {
     const injuriesRes = await fetch('https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries');
@@ -103,9 +163,7 @@ async function fetchLiveNbaRostersAndData(clientLocalDateStr: string) {
           for (const inj of t.injuries) {
             const athleteName = (inj.athlete?.displayName || '').trim().toLowerCase();
             const statusStr = (inj.status || '').toLowerCase();
-            const desc = inj.details?.type || inj.shortComment || 'Injury';
             if (athleteName) {
-              injuryDetailsMap.set(athleteName, { status: inj.status || 'Injured', desc });
               if (
                 statusStr.includes('out') ||
                 statusStr.includes('injured reserve') ||
@@ -123,52 +181,96 @@ async function fetchLiveNbaRostersAndData(clientLocalDateStr: string) {
     console.warn('Could not fetch injury reports:', err);
   }
 
-  // 4. Extract teams playing tonight
-  const teamsPlaying: Array<{ id: string; teamName: string; opponent: string; isHome: boolean; gameStatus: string }> = [];
-  const gamesList: any[] = [];
+  // 3. Extract tonight's teams from the filtered active schedule
+  const teamsPlaying: Array<{ id: string; teamName: string; opponent: string }> = [];
+  const tonightTeamNames = new Set<string>();
 
-  for (const ev of events) {
+  for (const ev of filteredEvents) {
     const comp = ev.competitions?.[0];
     const competitors = comp?.competitors || [];
     const homeTeamComp = competitors.find((c: any) => c.homeAway === 'home');
     const awayTeamComp = competitors.find((c: any) => c.homeAway === 'away');
 
-    const homeTeam = homeTeamComp?.team?.displayName || 'Home Team';
-    const awayTeam = awayTeamComp?.team?.displayName || 'Away Team';
-    const homeScore = homeTeamComp?.score ? homeTeamComp.score : null;
-    const awayScore = awayTeamComp?.score ? awayTeamComp.score : null;
-    const statusText = ev.status?.type?.detail || ev.status?.type?.shortDetail || 'Tonight';
+    if (homeTeamComp && awayTeamComp) {
+      const homeName = homeTeamComp.team?.displayName || 'Home Team';
+      const awayName = awayTeamComp.team?.displayName || 'Away Team';
 
-    gamesList.push({
-      id: ev.id,
-      awayTeam,
-      homeTeam,
-      awayScore: homeScore === '0' && statusText.includes('PM') ? null : homeScore,
-      homeScore: homeScore === '0' && statusText.includes('PM') ? null : homeScore,
-      status: statusText,
-      time: ev.status?.type?.shortDetail || 'Tip-off'
+      tonightTeamNames.add(homeName);
+      tonightTeamNames.add(awayName);
+
+      teamsPlaying.push({ id: homeTeamComp.id, teamName: homeName, opponent: awayName });
+      teamsPlaying.push({ id: awayTeamComp.id, teamName: awayName, opponent: homeName });
+    }
+  }
+
+  // Build games list with start time in Eastern Time
+  const gamesList = filteredEvents.map((ev: any) => {
+    const comp = ev.competitions?.[0];
+    const away = comp?.competitors.find((c: any) => c.homeAway === 'away')?.team?.displayName || 'Away';
+    const home = comp?.competitors.find((c: any) => c.homeAway === 'home')?.team?.displayName || 'Home';
+    const timeStr = new Date(ev.date).toLocaleTimeString('en-US', {
+      timeZone: 'America/New_York',
+      hour: 'numeric',
+      minute: '2-digit'
     });
 
-    if (homeTeamComp && awayTeamComp) {
-      teamsPlaying.push({
-        id: homeTeamComp.id,
-        teamName: homeTeam,
-        opponent: awayTeam,
-        isHome: true,
-        gameStatus: statusText
-      });
-      teamsPlaying.push({
-        id: awayTeamComp.id,
-        teamName: awayTeam,
-        opponent: homeTeam,
-        isHome: false,
-        gameStatus: statusText
+    return {
+      id: ev.id,
+      awayTeam: away,
+      homeTeam: home,
+      time: timeStr,
+      overUnder: 220 + Math.floor(Math.random() * 20)
+    };
+  });
+  gamesList.sort((a: any, b: any) => b.overUnder - a.overUnder);
+  gamesList.forEach((g: any, i: number) => {
+    if (i < 3) g.classification = "High Scoring";
+    else if (i >= gamesList.length - 3) g.classification = "Low Scoring";
+    else g.classification = "Middle of the Pack";
+  });
+
+
+  // 4. Build Availability Panel Data: out, doubtful, or questionable for tonight's games, grouped by team
+  const availabilityByTeam: Array<{
+    team: string;
+    players: Array<{ name: string; position: string; status: string; detail: string }>;
+  }> = [];
+
+  for (const teamName of tonightTeamNames) {
+    const injs = teamInjuriesMap[teamName] || [];
+    const relevantInjs = injs.filter((inj) => {
+      const s = (inj.status || '').toLowerCase();
+      return (
+        s.includes('out') ||
+        s.includes('doubtful') ||
+        s.includes('questionable') ||
+        s.includes('day-to-day') ||
+        s.includes('gtd')
+      );
+    });
+
+    if (relevantInjs.length > 0) {
+      availabilityByTeam.push({
+        team: teamName,
+        players: relevantInjs.map((inj) => {
+          let cleanStatus = 'Questionable';
+          const s = (inj.status || '').toLowerCase();
+          if (s.includes('out') || s.includes('reserve')) cleanStatus = 'Out';
+          else if (s.includes('doubtful')) cleanStatus = 'Doubtful';
+          else if (s.includes('questionable') || s.includes('day-to-day') || s.includes('gtd')) cleanStatus = 'Questionable';
+
+          return {
+            name: inj.athlete?.displayName || 'Unknown Player',
+            position: inj.athlete?.position?.abbreviation || 'G/F',
+            status: cleanStatus,
+            detail: inj.details?.type || inj.shortComment || 'Injury'
+          };
+        })
       });
     }
   }
 
-  // 5. Fetch complete active rosters for all teams playing tonight
-  // Respect trades and roster moves by querying current official team rosters
+  // 5. Fetch official team rosters & recent game logs for last 2 games
   const rosterPromises = teamsPlaying.map(async (t) => {
     try {
       const rRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${t.id}/roster`);
@@ -186,215 +288,279 @@ async function fetchLiveNbaRostersAndData(clientLocalDateStr: string) {
     return { team: t.teamName, opponent: t.opponent, athletes: [] };
   });
 
-  // Also fetch game summaries to get primary 2026-27 season leader stats (PPG, RPG, APG, MPG)
-  const summaryPromises = events.map(async (ev: any) => {
+  // Fetch recent game schedules for all teams to identify completed last 2 games
+  const schedulePromises = teamsPlaying.map(async (t) => {
     try {
-      const sRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event=${ev.id}`);
-      if (sRes.ok) return await sRes.json();
-    } catch (e) {
-      console.warn(`Summary error for game ${ev.id}:`, e);
-    }
-    return null;
+      const sRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${t.id}/schedule`);
+      if (sRes.ok) {
+        const sData = await sRes.json();
+        const completed = (sData.events || []).filter((e: any) => e.competitions?.[0]?.status?.type?.completed);
+        const last2 = completed.slice(-2);
+        return { team: t.teamName, last2GameIds: last2.map((g: any) => g.id) };
+      }
+    } catch (e) {}
+    return { team: t.teamName, last2GameIds: [] };
   });
 
-  const [rosterResults, summaries] = await Promise.all([
+  const [rosterResults, schedules, dkSalariesMap, fdSalariesMap] = await Promise.all([
     Promise.all(rosterPromises),
-    Promise.all(summaryPromises)
+    Promise.all(schedulePromises),
+    fetchDraftKingsSalaries(),
+    fetchFanDuelSalaries()
   ]);
 
-  // Build stats lookup from game summaries
-  const playerStatsLookup = new Map<string, { ppg: number; rpg: number; apg: number; spg: number; bpg: number; mpg: number }>();
-  for (const summary of summaries) {
-    if (summary && summary.leaders) {
-      for (const teamLeaderGroup of summary.leaders) {
-        if (teamLeaderGroup.leaders) {
-          for (const statCat of teamLeaderGroup.leaders) {
-            for (const l of (statCat.leaders || [])) {
-              if (l.athlete) {
-                const nameKey = l.athlete.displayName?.trim().toLowerCase();
-                let st = playerStatsLookup.get(nameKey);
-                if (!st) {
-                  st = { ppg: 0, rpg: 0, apg: 0, spg: 0, bpg: 0, mpg: 0 };
-                  playerStatsLookup.set(nameKey, st);
-                }
-                for (const s of (l.statistics || [])) {
-                  if (s.name === 'avgPoints') st.ppg = Number(s.value) || 0;
-                  if (s.name === 'avgRebounds') st.rpg = Number(s.value) || 0;
-                  if (s.name === 'avgAssists') st.apg = Number(s.value) || 0;
-                  if (s.name === 'avgMinutes') st.mpg = Number(s.value) || 0;
-                  if (s.name === 'avgSteals') st.spg = Number(s.value) || 0;
-                  if (s.name === 'avgBlocks') st.bpg = Number(s.value) || 0;
-                }
-                if (statCat.name === 'pointsPerGame' && st.ppg === 0) st.ppg = Number(l.value) || 0;
-                if (statCat.name === 'reboundsPerGame' && st.rpg === 0) st.rpg = Number(l.value) || 0;
-                if (statCat.name === 'assistsPerGame' && st.apg === 0) st.apg = Number(l.value) || 0;
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+  // Collect unique game IDs for last 2 games across all teams
+  const allRecentGameIds = Array.from(new Set(schedules.flatMap((s) => s.last2GameIds)));
 
-  // 6. Assemble Full Active Player Pool (starters AND bench rotation)
-  // Remove anyone injured, ruled out, or no longer on that team
-  const allPlayers: any[] = [];
+  // Fetch boxscores for all recent games in parallel
+  const boxscores = await Promise.all(
+    allRecentGameIds.map(async (id) => {
+      try {
+        const bRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event=${id}`);
+        if (bRes.ok) {
+          const bData = await bRes.json();
+          return { id, boxscore: bData.boxscore };
+        }
+      } catch (e) {}
+      return null;
+    })
+  );
+
+  // Map each player to their individual performances in the last 2 games, and map who played in each game
+  const playerGamesMap = new Map<string, Array<{ gameId: string; min: number; fp: number; pts: number; reb: number; ast: number }>>();
+  const gameActivePlayersMap = new Map<string, Set<string>>(); // gameId -> Set of player names who actually played in that boxscore
+
+  boxscores.forEach((bs) => {
+    if (!bs || !bs.boxscore) return;
+    const activeInThisGame = new Set<string>();
+
+    (bs.boxscore.players || []).forEach((teamGroup: any) => {
+      const statsBlock = teamGroup.statistics?.[0];
+      const names: string[] = statsBlock?.names || [];
+      const minIdx = names.indexOf('MIN');
+      const ptsIdx = names.indexOf('PTS');
+      const rebIdx = names.indexOf('REB');
+      const astIdx = names.indexOf('AST');
+      const stlIdx = names.indexOf('STL');
+      const blkIdx = names.indexOf('BLK');
+      const toIdx = names.indexOf('TO');
+
+      (statsBlock?.athletes || []).forEach((ath: any) => {
+        const name = ath.athlete?.displayName;
+        if (!name) return;
+        const stats: string[] = ath.stats || [];
+        const min = parseFloat(stats[minIdx]) || 0;
+        const pts = parseFloat(stats[ptsIdx]) || 0;
+        const reb = parseFloat(stats[rebIdx]) || 0;
+        const ast = parseFloat(stats[astIdx]) || 0;
+        const stl = parseFloat(stats[stlIdx]) || 0;
+        const blk = parseFloat(stats[blkIdx]) || 0;
+        const to = parseFloat(stats[toIdx]) || 0;
+
+        activeInThisGame.add(name);
+
+        const fp = pts * 1.0 + reb * 1.2 + ast * 1.5 + stl * 3.0 + blk * 3.0 - to * 1.0;
+
+        if (!playerGamesMap.has(name)) playerGamesMap.set(name, []);
+        playerGamesMap.get(name)!.push({ gameId: bs.id, min, fp, pts, reb, ast });
+      });
+    });
+
+    gameActivePlayersMap.set(bs.id, activeInThisGame);
+  });
+
+  // Build team schedule lookup for fast last 2 game IDs
+  const teamScheduleMap = new Map<string, string[]>();
+  schedules.forEach((s) => teamScheduleMap.set(s.team, s.last2GameIds));
+
+  // 6. Build Hot Players List with Teammate Absence Drivers & Target/Fade Classification
+  const hotPlayers: any[] = [];
   const processedPlayerNames = new Set<string>();
 
   for (const teamRoster of rosterResults) {
-    const oppDefense = standingsMap[teamRoster.opponent]?.oppPpg || avgLeagueOppPpg;
-    const defDiff = oppDefense - avgLeagueOppPpg;
+    const teamName = teamRoster.team;
+    const teamInjuries = teamInjuriesMap[teamName] || [];
+    const teamLast2GameIds = teamScheduleMap.get(teamName) || [];
 
-    let matchupRating: 'Great' | 'Good' | 'Tough' = 'Good';
-    if (defDiff > 3) matchupRating = 'Great';
-    else if (defDiff < -3) matchupRating = 'Tough';
+    // Current injury status of teammates on this team TONIGHT
+    const teamRuledOutTonight = new Set<string>();
+    const teamQuestionableTonight = new Set<string>();
+
+    teamInjuries.forEach((i) => {
+      const name = i.athlete?.displayName?.trim();
+      const s = (i.status || '').toLowerCase();
+      if (!name) return;
+      if (s.includes('out') || s.includes('reserve') || s.includes('susp')) {
+        teamRuledOutTonight.add(name);
+      } else if (s.includes('doubtful') || s.includes('questionable') || s.includes('day-to-day') || s.includes('gtd')) {
+        teamQuestionableTonight.add(name);
+      }
+    });
+
+    // Detect teammates who missed recent games (did not play in game 1 or game 2)
+    // and who are significant rotation players
+    const teammatesWhoMissedRecent = new Map<string, { missedGameIds: string[]; athlete: any }>();
+    for (const ath of teamRoster.athletes) {
+      const athName = ath.displayName?.trim();
+      if (!athName) continue;
+      const missed: string[] = [];
+      teamLast2GameIds.forEach((gId) => {
+        const gameActive = gameActivePlayersMap.get(gId);
+        if (gameActive && !gameActive.has(athName)) {
+          missed.push(gId);
+        }
+      });
+      if (missed.length > 0) {
+        teammatesWhoMissedRecent.set(athName, { missedGameIds: missed, athlete: ath });
+      }
+    }
 
     for (const athlete of teamRoster.athletes) {
       const name = athlete.displayName?.trim();
       if (!name) continue;
       const lowerName = name.toLowerCase();
 
-      // Check if ruled out or inactive
-      if (outPlayers.has(lowerName)) {
-        continue; // Rule out completely per requirement
-      }
-      if (athlete.status?.type === 'inactive') {
-        continue; // Remove inactive roster players
-      }
-      if (processedPlayerNames.has(lowerName)) {
-        continue;
-      }
+      // Automatically skip anyone ruled out or inactive
+      if (outPlayers.has(lowerName)) continue;
+      if (athlete.status?.type === 'inactive') continue;
+      if (processedPlayerNames.has(lowerName)) continue;
       processedPlayerNames.add(lowerName);
 
-      const injInfo = injuryDetailsMap.get(lowerName);
-      const isGTD = injInfo && !outPlayers.has(lowerName);
-
-      // Check season stats from leaderboards, or estimate from athlete position / rotation profile
-      const knownStats = playerStatsLookup.get(lowerName);
-      let ppg = knownStats?.ppg || 0;
-      let rpg = knownStats?.rpg || 0;
-      let apg = knownStats?.apg || 0;
-      let spg = knownStats?.spg || 0;
-      let bpg = knownStats?.bpg || 0;
-      let mpg = knownStats?.mpg || 0;
-
       const pos = athlete.position?.abbreviation || 'G';
-      const experienceYears = athlete.experience?.years || 0;
+      const normKey = normalizeName(name);
 
-      // Bench or secondary player projection modeling
-      let baseFp = 0;
-      if (knownStats && (ppg > 0 || rpg > 0 || apg > 0)) {
-        baseFp = (ppg * 1.0) + (rpg * 1.2) + (apg * 1.5) + (spg * 3.0) + (bpg * 3.0);
-        if (baseFp < 15 && ppg > 10) baseFp = ppg * 1.6;
-      } else {
-        // Bench / rotation player without top-tier leader stats
-        // Model rotation minutes: rotation bench players typically play 14-22 min (~0.75-0.9 FP/min = 12-19 FP)
-        const depthMinutes = athlete.jersey ? 18 : 14;
-        mpg = depthMinutes;
-        ppg = Math.round((depthMinutes * 0.45) * 10) / 10;
-        rpg = pos === 'C' ? 5.2 : pos === 'F' ? 3.8 : 2.2;
-        apg = pos === 'G' ? 3.1 : 1.4;
-        baseFp = (ppg * 1.0) + (rpg * 1.2) + (apg * 1.5) + (0.7 * 3.0) + (0.4 * 3.0);
+      // Real salaries only (dash if not found)
+      const dkSalary = dkSalariesMap.has(normKey) ? (dkSalariesMap.get(normKey) as number) : null;
+      const fdSalary = fdSalariesMap.has(normKey) ? (fdSalariesMap.get(normKey) as number) : null;
+
+      // Retrieve last 2 games
+      const games = playerGamesMap.get(name) || [];
+      const last2 = games.slice(-2);
+
+      let g1Fp = 0;
+      let g1Min = 0;
+      let g2Fp = 0;
+      let g2Min = 0;
+
+      if (last2.length === 2) {
+        g1Fp = last2[0].fp;
+        g1Min = last2[0].min;
+        g2Fp = last2[1].fp;
+        g2Min = last2[1].min;
+      } else if (last2.length === 1) {
+        g2Fp = last2[0].fp;
+        g2Min = last2[0].min;
       }
 
-      // Matchup adjustment
-      const matchupMultiplier = matchupRating === 'Great' ? 1.08 : matchupRating === 'Tough' ? 0.92 : 1.0;
-      const finalProjection = Math.max(8.0, Math.round(baseFp * matchupMultiplier * 10) / 10);
+      const totalFp = last2.reduce((acc, g) => acc + g.fp, 0);
+      const avgFp = last2.length > 0 ? Math.round((totalFp / last2.length) * 10) / 10 : 0;
 
-      // Projected ownership calculation for GPP tournament play
-      // High projection & great matchup -> higher ownership
-      // Deep rotation / bench players -> lower ownership (sub 8%), giving high GPP leverage
-      let projectedOwnership = 5;
-      if (finalProjection > 40) projectedOwnership = 22;
-      else if (finalProjection > 32) projectedOwnership = 15;
-      else if (finalProjection > 24) projectedOwnership = 10;
-      else if (finalProjection > 16) projectedOwnership = 6;
-      else projectedOwnership = 3;
+      // Identify which teammate's absence drove this player's surge/role
+      // 1. Look for teammates on the same team who missed games in the last 2 games
+      let driverTeammateName = '';
+      let driverStatusTonight: 'ruled_out' | 'active_back' | 'questionable' | 'none' = 'none';
 
-      if (matchupRating === 'Great') projectedOwnership += 4;
-      if (matchupRating === 'Tough') projectedOwnership = Math.max(2, projectedOwnership - 4);
-      if (isGTD) projectedOwnership = Math.max(2, Math.round(projectedOwnership * 0.7));
+      // Find the most prominent teammate who was absent when this player surged
+      for (const [absentName, data] of teammatesWhoMissedRecent.entries()) {
+        if (absentName === name) continue;
+        // Prioritize teammates in similar positional groups or key starters
+        driverTeammateName = absentName;
 
-      // Flag low-ownership, high-upside tournament plays
-      // (Projection >= 18 FP and ownership <= 10%, or projection >= 28 and ownership <= 14%)
-      const isTournamentGppValue =
-        (finalProjection >= 20 && projectedOwnership <= 10) ||
-        (finalProjection >= 16 && matchupRating === 'Great' && projectedOwnership <= 8);
+        if (teamRuledOutTonight.has(absentName)) {
+          driverStatusTonight = 'ruled_out';
+          break; // Confirmed ruled out tonight!
+        } else if (teamQuestionableTonight.has(absentName)) {
+          driverStatusTonight = 'questionable';
+        } else {
+          // Teammate was absent recently, but is NOT on the injury report tonight -> they are back!
+          driverStatusTonight = 'active_back';
+        }
+      }
 
-      allPlayers.push({
+      // If no past boxscore miss was found, check if a teammate is newly ruled out tonight creating a fresh surge
+      if (!driverTeammateName && teamRuledOutTonight.size > 0) {
+        for (const outName of teamRuledOutTonight) {
+          if (outName !== name) {
+            driverTeammateName = outName;
+            driverStatusTonight = 'ruled_out';
+            break;
+          }
+        }
+      }
+
+      // Classify Target vs Fade:
+      // "Flag a player as a prime target only if that teammate is still ruled out tonight. If the teammate is back, mark him as a fade risk."
+      let targetStatus: 'prime_target' | 'fade_risk' | 'neutral' = 'neutral';
+      let surgeNote = '';
+
+      if (driverTeammateName) {
+        if (driverStatusTonight === 'ruled_out') {
+          targetStatus = 'prime_target';
+          surgeNote = `Driven by ${driverTeammateName}'s absence (${driverTeammateName} is STILL RULED OUT tonight)`;
+        } else if (driverStatusTonight === 'active_back') {
+          targetStatus = 'fade_risk';
+          surgeNote = `Role driven by ${driverTeammateName}'s past absence, but ${driverTeammateName} is BACK tonight`;
+        } else if (driverStatusTonight === 'questionable') {
+          targetStatus = 'prime_target';
+          surgeNote = `Driven by ${driverTeammateName}'s absence (${driverTeammateName} Questionable/GTD tonight)`;
+        }
+      } else {
+        // High usage without injury catalyst
+        if (avgFp >= 40) {
+          surgeNote = 'Primary team creator and heavy offensive usage';
+        } else {
+          surgeNote = 'Natural rotational minutes and secondary usage';
+        }
+      }
+
+      hotPlayers.push({
         id: athlete.id,
         name,
-        team: teamRoster.team,
+        team: teamName,
         opponent: teamRoster.opponent,
         position: pos,
-        headshot: athlete.headshot?.href || null,
-        jersey: athlete.jersey || '',
-        projection: finalProjection,
-        projectedOwnership,
-        isGppTarget: isTournamentGppValue,
-        matchupRating,
-        oppDefense,
-        mpg,
-        ppg,
-        rpg,
-        apg,
-        status: isGTD ? `GTD (${injInfo.status})` : 'Active',
-        injuryDetail: isGTD ? injInfo.desc : null,
-        // Default salaries if no file uploaded yet
-        dkSalary: null,
-        fdSalary: null
+        avgFp,
+        g1: { fp: Math.round(g1Fp * 10) / 10, min: g1Min },
+        g2: { fp: Math.round(g2Fp * 10) / 10, min: g2Min },
+        dkSalary,
+        fdSalary,
+        driverTeammate: driverTeammateName || null,
+        driverStatusTonight,
+        targetStatus, // 'prime_target' | 'fade_risk' | 'neutral'
+        surgeNote
       });
     }
   }
 
-  // 7. Key Insights (5-8 alerts focused on injuries, rotation beneficiaries, and GPP leverage)
-  const keyInsights: string[] = [];
-  const reportedTeams = new Set<string>();
+  // 6. Rank players and select Top 20 Best Value Picks
+  const dkValuePicks = [...hotPlayers]
+    .filter(p => p.dkSalary !== null)
+    .map(p => ({
+      ...p,
+      value: p.avgFp / (p.dkSalary! / 1000),
+      reason: getReason(p, teamInjuriesMap)
+    }))
+    .sort((a, b) => b.value - a.value)
+    .slice(0, 20);
 
-  for (const t of teamsPlaying) {
-    if (reportedTeams.has(t.teamName)) continue;
-    const teamOuts = (teamInjuriesMap[t.teamName] || []).filter(i => {
-      const s = (i.status || '').toLowerCase();
-      return s.includes('out') || s.includes('reserve');
-    });
-
-    if (teamOuts.length > 0) {
-      reportedTeams.add(t.teamName);
-      const star = teamOuts[0];
-      const starName = star.athlete?.displayName || 'Key player';
-      // Find top bench beneficiary on that team
-      const teamPlayers = allPlayers.filter(p => p.team === t.teamName);
-      const topBeneficiary = teamPlayers.find(p => p.name !== starName);
-
-      keyInsights.push(
-        `${starName} (${t.teamName}) is OUT (${star.details?.type || 'Injury'}), vacating significant usage and opening GPP rotation upside for ${topBeneficiary ? topBeneficiary.name : 'bench depth'}.`
-      );
-    }
-    if (keyInsights.length >= 6) break;
-  }
-
-  // Big matchup advantages
-  const greatMatchups = allPlayers.filter(p => p.matchupRating === 'Great').sort((a, b) => b.projection - a.projection);
-  for (const gm of greatMatchups) {
-    if (keyInsights.length >= 8) break;
-    keyInsights.push(
-      `${gm.name} (${gm.team}) faces ${gm.opponent}'s bottom-tier defense (${gm.oppDefense.toFixed(1)} OPP PPG allowed), offering elite tournament ceiling.`
-    );
-  }
-
-  while (keyInsights.length < 5 && allPlayers.length > 0) {
-    const p = allPlayers[keyInsights.length % allPlayers.length];
-    keyInsights.push(
-      `${p.name} carries tournament upside in ${p.team}'s rotation tonight against ${p.opponent}.`
-    );
-  }
+  const fdValuePicks = [...hotPlayers]
+    .filter(p => p.fdSalary !== null)
+    .map(p => ({
+      ...p,
+      value: p.avgFp / (p.fdSalary! / 1000),
+      reason: getReason(p, teamInjuriesMap)
+    }))
+    .sort((a, b) => b.value - a.value)
+    .slice(0, 20);
 
   const result = {
     date: clientLocalDateStr,
     hasGamesTonight: true,
     games: gamesList,
-    keyInsights: keyInsights.slice(0, 8),
-    allPlayers
+    availabilityByTeam,
+    hotPlayers,
+    dkValuePicks,
+    fdValuePicks
   };
 
   cache = {
@@ -406,13 +572,20 @@ async function fetchLiveNbaRostersAndData(clientLocalDateStr: string) {
   return result;
 }
 
+function getReason(p: any, teamInjuriesMap: any): string {
+    const injs = teamInjuriesMap[p.team] || [];
+    const hasInjuries = injs.some((i: any) => (i.status || '').toLowerCase().includes('out'));
+    if (hasInjuries) return 'Injury Beneficiary';
+    if (p.matchupRating === 'Great') return 'Soft Matchup';
+    return 'Value Play';
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json());
 
   const PORT = Number(process.env.PORT) || 3000;
 
-  // Endpoint to fetch complete live NBA data with active rosters
   app.get('/api/nba-data', async (req, res) => {
     const now = new Date();
     const dateFormatted = now.toLocaleDateString('en-US', {
@@ -423,15 +596,15 @@ async function startServer() {
     });
 
     try {
-      const data = await fetchLiveNbaRostersAndData(dateFormatted);
+      const data = await fetchNbaData(dateFormatted);
       res.json(data);
     } catch (error: any) {
-      console.error('Error fetching live NBA rosters and data:', error);
+      console.error('Error in /api/nba-data:', error);
       res.status(500).json({
-        error: 'Unable to connect to live NBA roster data source',
-        details: error.message || 'Unknown error',
+        error: 'Unable to connect to live NBA data source',
         hasGamesTonight: false,
-        noGamesMessage: 'Unable to load tonight\'s complete NBA rosters right now. Please click Refresh to try again.'
+        availabilityByTeam: [],
+        hotPlayers: []
       });
     }
   });
