@@ -620,6 +620,22 @@ async function startServer() {
     }
   });
 
+  // In-memory / shared persistence fallback for FanDuel salaries across computers
+  let sharedFanDuelSalariesData: any = null;
+
+  app.get('/api/shared-fanduel-salaries', (req, res) => {
+    res.json(sharedFanDuelSalariesData || {});
+  });
+
+  app.post('/api/shared-fanduel-salaries', (req, res) => {
+    try {
+      sharedFanDuelSalariesData = req.body;
+      res.json({ success: true, timestamp: sharedFanDuelSalariesData?.timestamp });
+    } catch (e: any) {
+      res.status(400).json({ error: e.message || 'Invalid payload' });
+    }
+  });
+
   if (process.env.NODE_ENV === 'production') {
     app.use(express.static(path.join(__dirname, 'dist')));
     app.get('*', (req, res) => {

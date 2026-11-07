@@ -1,0 +1,41 @@
+{
+  "entities": {
+    "fanduel_salaries": {
+      "title": "FanDuel Salaries",
+      "description": "Shared FanDuel player salaries, upload timestamps, and matching stats",
+      "type": "object",
+      "properties": {
+        "salaries": {
+          "type": "object",
+          "description": "Map of player normalized or display name to salary in dollars"
+        },
+        "uploadDate": {
+          "type": "string",
+          "description": "Formatted date and time of the upload in local / ET display"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "Unix timestamp in milliseconds when the upload occurred"
+        },
+        "matchedCount": {
+          "type": "number",
+          "description": "Number of players successfully matched"
+        },
+        "unmatchedNames": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "List of names that could not be matched"
+        }
+      },
+      "required": ["salaries", "uploadDate", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/fanduel_salaries/{docId}": {
+      "schema": "fanduel_salaries",
+      "description": "Latest uploaded FanDuel salaries document"
+    }
+  }
+}

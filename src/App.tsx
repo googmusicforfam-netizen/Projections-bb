@@ -5,6 +5,12 @@
 
 import React, { useState, useEffect, useMemo } from 'react';
 import { RefreshCw, Flame, AlertCircle, Info, Upload } from 'lucide-react';
+import {
+  saveFanDuelSalariesToCloud,
+  getFanDuelSalariesFromCloud,
+  subscribeToFanDuelSalaries,
+  SavedFanDuelData
+} from './firebase';
 
 interface Game {
   id: string;
@@ -186,7 +192,7 @@ export default function App() {
   const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' } | null>(null);
   const [uploadStatus, setUploadStatus] = useState<{ text: string; isError: boolean } | null>(null);
 
-  // Persistent FanDuel uploaded salaries state
+  // Persistent FanDuel uploaded salaries state (synced with Firestore / shared cloud)
   const [fdSalariesMap, setFdSalariesMap] = useState<Record<string, number>>(() => {
     try {
       const saved = localStorage.getItem('nba_fd_salaries_cache');
@@ -198,14 +204,35 @@ export default function App() {
     return {};
   });
 
-  const [fdUploadInfo, setFdUploadInfo] = useState<{ timestamp: string; matchedCount: number; unmatchedNames: string[] } | null>(() => {
+  const [fdUploadInfo, setFdUploadInfo] = useState<{
+    dateStr: string;
+    isToday: boolean;
+    timestamp: number;
+    matchedCount: number;
+    unmatchedNames: string[];
+  } | null>(() => {
     try {
       const saved = localStorage.getItem('nba_fd_salaries_cache');
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (parsed.timestamp) {
+        if (parsed.uploadDate || parsed.timestamp) {
+          const uploadTime = typeof parsed.timestamp === 'number' ? parsed.timestamp : Date.now();
+          const uploadDateObj = new Date(uploadTime);
+          const todayDateObj = new Date();
+          const isToday =
+            uploadDateObj.getFullYear() === todayDateObj.getFullYear() &&
+            uploadDateObj.getMonth() === todayDateObj.getMonth() &&
+            uploadDateObj.getDate() === todayDateObj.getDate();
+
           return {
-            timestamp: parsed.timestamp,
+            dateStr: parsed.uploadDate || uploadDateObj.toLocaleString('en-US', {
+              month: 'short',
+              day: 'numeric',
+              hour: 'numeric',
+              minute: '2-digit'
+            }),
+            isToday,
+            timestamp: uploadTime,
             matchedCount: parsed.matchedCount || 0,
             unmatchedNames: parsed.unmatchedNames || []
           };
@@ -215,8 +242,101 @@ export default function App() {
     return null;
   });
 
-  // Handle FanDuel CSV upload with error messaging
-  const handleFanDuelUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Helper to format upload timestamp and detect if it is today
+  const formatUploadInfo = (uploadDate: string, timestamp: number, matchedCount: number, unmatchedNames: string[]) => {
+    const uploadDateObj = new Date(timestamp);
+    const todayDateObj = new Date();
+    const isToday =
+      uploadDateObj.getFullYear() === todayDateObj.getFullYear() &&
+      uploadDateObj.getMonth() === todayDateObj.getMonth() &&
+      uploadDateObj.getDate() === todayDateObj.getDate();
+
+    return {
+      dateStr: uploadDate || uploadDateObj.toLocaleString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit'
+      }),
+      isToday,
+      timestamp,
+      matchedCount,
+      unmatchedNames
+    };
+  };
+
+  // Synchronize with Firestore & server shared cache on mount and in real-time
+  useEffect(() => {
+    let isMounted = true;
+
+    // 1. Listen to real-time Firestore updates
+    const unsubscribe = subscribeToFanDuelSalaries((cloudData) => {
+      if (!isMounted || !cloudData) return;
+      if (cloudData.salaries && Object.keys(cloudData.salaries).length > 0) {
+        setFdSalariesMap(cloudData.salaries);
+        const info = formatUploadInfo(
+          cloudData.uploadDate,
+          cloudData.timestamp,
+          cloudData.matchedCount || 0,
+          cloudData.unmatchedNames || []
+        );
+        setFdUploadInfo(info);
+        try {
+          localStorage.setItem('nba_fd_salaries_cache', JSON.stringify(cloudData));
+        } catch (e) {}
+      }
+    });
+
+    // 2. Initial fetch check from Firestore, and fallback to server route
+    const loadInitialCloudSalaries = async () => {
+      try {
+        const cloudData = await getFanDuelSalariesFromCloud();
+        if (cloudData && cloudData.salaries && Object.keys(cloudData.salaries).length > 0) {
+          if (!isMounted) return;
+          setFdSalariesMap(cloudData.salaries);
+          setFdUploadInfo(formatUploadInfo(
+            cloudData.uploadDate,
+            cloudData.timestamp,
+            cloudData.matchedCount || 0,
+            cloudData.unmatchedNames || []
+          ));
+          try {
+            localStorage.setItem('nba_fd_salaries_cache', JSON.stringify(cloudData));
+          } catch (e) {}
+          return;
+        }
+      } catch (err) {
+        console.warn('Firestore initial get notice:', err);
+      }
+
+      // Check server shared route if Firestore document was not populated yet
+      try {
+        const res = await fetch('/api/shared-fanduel-salaries');
+        if (res.ok) {
+          const srvData = await res.json();
+          if (srvData && srvData.salaries && Object.keys(srvData.salaries).length > 0 && isMounted) {
+            setFdSalariesMap(srvData.salaries);
+            setFdUploadInfo(formatUploadInfo(
+              srvData.uploadDate,
+              srvData.timestamp,
+              srvData.matchedCount || 0,
+              srvData.unmatchedNames || []
+            ));
+          }
+        }
+      } catch (e) {}
+    };
+
+    loadInitialCloudSalaries();
+
+    return () => {
+      isMounted = false;
+      unsubscribe();
+    };
+  }, []);
+
+  // Handle FanDuel CSV upload with error messaging & Firestore cloud saving
+  const handleFanDuelUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -228,7 +348,7 @@ export default function App() {
       setUploadStatus({ text: 'Error reading file from disk.', isError: true });
     };
 
-    reader.onload = (event) => {
+    reader.onload = async (event) => {
       try {
         const text = event.target?.result as string;
         if (!text) {
@@ -256,25 +376,70 @@ export default function App() {
         const totalLoaded = parsedPlayers.length;
         const unmatchedCount = totalLoaded - matched;
 
-        const uploadMetadata = {
+        const now = new Date();
+        const dateFormatted = now.toLocaleDateString('en-US', {
+          month: 'short',
+          day: 'numeric',
+          year: 'numeric'
+        });
+        const timeFormatted = now.toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit'
+        });
+        const fullUploadDateStr = `${dateFormatted} at ${timeFormatted}`;
+        const currentTimestamp = Date.now();
+
+        const uploadMetadata: SavedFanDuelData = {
           salaries: newMap,
-          timestamp: new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', month: 'numeric', day: 'numeric' }),
+          uploadDate: fullUploadDateStr,
+          timestamp: currentTimestamp,
           matchedCount: matched,
           unmatchedNames: unmatchedList
         };
 
+        // Update local state immediately
         setFdSalariesMap(newMap);
-        setFdUploadInfo({
-          timestamp: uploadMetadata.timestamp,
-          matchedCount: matched,
-          unmatchedNames: unmatchedList
-        });
+        setFdUploadInfo(formatUploadInfo(
+          fullUploadDateStr,
+          currentTimestamp,
+          matched,
+          unmatchedList
+        ));
 
         setUploadStatus({
-          text: `Loaded ${totalLoaded} players (${matched} matched, ${unmatchedCount} unmatched)`,
+          text: `Loaded ${totalLoaded} players (${matched} matched, ${unmatchedCount} unmatched) · Saving to cloud...`,
           isError: false
         });
 
+        // 1. Save to Firebase Firestore cloud database
+        try {
+          await saveFanDuelSalariesToCloud(uploadMetadata);
+          setUploadStatus({
+            text: `Loaded ${totalLoaded} players (${matched} matched, ${unmatchedCount} unmatched) · Saved to Cloud Database`,
+            isError: false
+          });
+        } catch (dbErr: any) {
+          console.warn('Could not save to Firestore directly:', dbErr);
+          // Fallback to server shared route
+          try {
+            await fetch('/api/shared-fanduel-salaries', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(uploadMetadata)
+            });
+            setUploadStatus({
+              text: `Loaded ${totalLoaded} players (${matched} matched, ${unmatchedCount} unmatched) · Saved to Shared Server`,
+              isError: false
+            });
+          } catch (srvErr) {
+            setUploadStatus({
+              text: `Loaded ${totalLoaded} players (${matched} matched, ${unmatchedCount} unmatched) · Saved Locally`,
+              isError: false
+            });
+          }
+        }
+
+        // Save to localStorage as quick local cache
         try {
           localStorage.setItem('nba_fd_salaries_cache', JSON.stringify(uploadMetadata));
         } catch (err) {}
@@ -538,9 +703,24 @@ export default function App() {
                   <div className="font-bold text-xs uppercase tracking-wider text-neutral-200">
                     2. Hot Players (Last 2 Games Performance)
                   </div>
-                  {fdUploadInfo && (
-                    <div className="text-[10px] text-neutral-400 mt-0.5">
-                      Last uploaded: {fdUploadInfo.timestamp} ({fdUploadInfo.matchedCount} players matched)
+                  {fdUploadInfo ? (
+                    <div className="text-[11px] text-neutral-400 mt-1 flex items-center gap-2">
+                      <span>
+                        FanDuel Upload: <span className="text-white font-medium">{fdUploadInfo.dateStr}</span> ({fdUploadInfo.matchedCount} players matched)
+                      </span>
+                      {fdUploadInfo.isToday ? (
+                        <span className="text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 px-1.5 py-0.5 rounded font-bold uppercase tracking-wider">
+                          Today's Salaries
+                        </span>
+                      ) : (
+                        <span className="text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/30 px-1.5 py-0.5 rounded font-bold uppercase tracking-wider">
+                          Prior Date
+                        </span>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="text-[10px] text-neutral-500 mt-0.5">
+                      No cloud FanDuel salaries saved yet.
                     </div>
                   )}
                 </div>
