@@ -35,8 +35,15 @@ let cache: {
 // Pull DraftKings Classic Salaries
 async function fetchDraftKingsSalaries(): Promise<Map<string, number>> {
   const salaryMap = new Map<string, number>();
+  const DK_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json'
+  };
+
   try {
-    const lobbyRes = await fetch('https://www.draftkings.com/lobby/getcontests?sport=NBA');
+    const lobbyRes = await fetch('https://www.draftkings.com/lobby/getcontests?sport=NBA', {
+      headers: DK_HEADERS
+    });
     if (!lobbyRes.ok) return salaryMap;
     const lobbyData = await lobbyRes.json();
 
@@ -49,11 +56,13 @@ async function fetchDraftKingsSalaries(): Promise<Map<string, number>> {
 
     slates.sort((a: any, b: any) => (b.GameCount || 0) - (a.GameCount || 0));
 
-    const targetSlates = slates.slice(0, 8);
+    const targetSlates = slates.slice(0, 15);
     const draftableResponses = await Promise.all(
       targetSlates.map(async (s: any) => {
         try {
-          const r = await fetch(`https://api.draftkings.com/draftgroups/v1/draftgroups/${s.DraftGroupId}/draftables`);
+          const r = await fetch(`https://www.draftkings.com/lineup/getavailableplayers?draftGroupId=${s.DraftGroupId}`, {
+            headers: DK_HEADERS
+          });
           if (r.ok) return await r.json();
         } catch (e) {}
         return null;
@@ -61,12 +70,13 @@ async function fetchDraftKingsSalaries(): Promise<Map<string, number>> {
     );
 
     draftableResponses.forEach((d) => {
-      if (d && d.draftables) {
-        d.draftables.forEach((p: any) => {
-          if (p.displayName && p.salary) {
-            const key = normalizeName(p.displayName);
+      if (d && d.playerList) {
+        d.playerList.forEach((p: any) => {
+          const fullName = `${p.fn || ''} ${p.ln || ''}`.trim();
+          if (fullName && p.s) {
+            const key = normalizeName(fullName);
             if (!salaryMap.has(key)) {
-              salaryMap.set(key, p.salary);
+              salaryMap.set(key, p.s);
             }
           }
         });
@@ -532,26 +542,27 @@ async function fetchNbaData(clientLocalDateStr: string) {
     }
   }
 
-  // 6. Rank players and select Top 20 Best Value Picks
+  // 6. Rank players and select Top 20 Best Value Picks for DraftKings
   const dkValuePicks = [...hotPlayers]
-    .filter(p => p.dkSalary !== null)
-    .map(p => ({
-      ...p,
-      value: p.avgFp / (p.dkSalary! / 1000),
-      reason: getReason(p, teamInjuriesMap)
-    }))
+    .filter(p => p.dkSalary !== null && p.dkSalary > 0)
+    .map(p => {
+      const game = gamesList.find(g => g.awayTeam === p.team || g.homeTeam === p.team);
+      return {
+        id: p.id,
+        name: p.name,
+        team: p.team,
+        salary: p.dkSalary!,
+        projectedFp: p.avgFp,
+        value: p.avgFp / (p.dkSalary! / 1000),
+        gameTime: game ? `${game.time} ET` : 'Tonight',
+        reason: getReason(p, teamInjuriesMap)
+      };
+    })
     .sort((a, b) => b.value - a.value)
     .slice(0, 20);
 
-  const fdValuePicks = [...hotPlayers]
-    .filter(p => p.fdSalary !== null)
-    .map(p => ({
-      ...p,
-      value: p.avgFp / (p.fdSalary! / 1000),
-      reason: getReason(p, teamInjuriesMap)
-    }))
-    .sort((a, b) => b.value - a.value)
-    .slice(0, 20);
+  // Server leaves FanDuel picks empty; populated strictly via user uploaded CSV
+  const fdValuePicks: any[] = [];
 
   const result = {
     date: clientLocalDateStr,

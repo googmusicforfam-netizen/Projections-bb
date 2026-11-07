@@ -49,9 +49,13 @@ interface HotPlayer {
 }
 
 interface ValuePick {
+  id?: string;
   name: string;
   team: string;
+  salary: number;
+  projectedFp: number;
   value: number;
+  gameTime?: string;
   reason: string;
 }
 
@@ -301,14 +305,29 @@ export default function App() {
     });
   }, [data?.hotPlayers, fdSalariesMap]);
 
-  // Recalculate FanDuel Top 20 list from processed salaries
-  const displayFdValuePicks = useMemo(() => {
-    const picks = processedHotPlayers
+  // Recalculate FanDuel Top 20 list strictly from uploaded salaries
+  const displayFdValuePicks = useMemo<ValuePick[]>(() => {
+    // Until a CSV is uploaded, return empty array so the FanDuel panel shows the upload prompt
+    if (Object.keys(fdSalariesMap).length === 0) {
+      return [];
+    }
+
+    const teamGameMap = new Map<string, string>();
+    (data?.games || []).forEach(g => {
+      teamGameMap.set(g.awayTeam, `${g.time} ET`);
+      teamGameMap.set(g.homeTeam, `${g.time} ET`);
+    });
+
+    return processedHotPlayers
       .filter(p => p.fdSalary !== null && p.fdSalary > 0)
       .map(p => ({
+        id: p.id,
         name: p.name,
         team: p.team,
+        salary: p.fdSalary!,
+        projectedFp: p.avgFp,
         value: p.avgFp / (p.fdSalary! / 1000),
+        gameTime: teamGameMap.get(p.team) || 'Tonight',
         reason: p.driverTeammate && p.driverStatusTonight === 'ruled_out'
           ? 'Injury Beneficiary'
           : p.avgFp >= 35
@@ -317,9 +336,7 @@ export default function App() {
       }))
       .sort((a, b) => b.value - a.value)
       .slice(0, 20);
-
-    return picks.length > 0 ? picks : (data?.fdValuePicks || []);
-  }, [processedHotPlayers, data?.fdValuePicks]);
+  }, [processedHotPlayers, fdSalariesMap, data?.games]);
 
   const sortedHotPlayers = useMemo(() => {
     if (!processedHotPlayers.length) return [];
@@ -425,34 +442,71 @@ export default function App() {
 
             {/* TOP 20 BEST VALUE PICKS */}
             <section className="bg-neutral-900 border border-neutral-800 rounded-lg p-4">
-              <h2 className="text-xs font-bold text-neutral-200 uppercase tracking-wider mb-4">Top 20 Best Value Picks</h2>
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-xs font-bold text-neutral-200 uppercase tracking-wider">Top 20 Best Value Picks (Entire Slate)</h2>
+                <span className="text-[10px] text-neutral-500">Ranked by projected FP per $1,000</span>
+              </div>
+
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 {['DK', 'FD'].map((site) => {
-                  const picksList = site === 'DK' ? data.dkValuePicks : displayFdValuePicks;
+                  const isDK = site === 'DK';
+                  const picksList: ValuePick[] = isDK ? (data.dkValuePicks || []) : displayFdValuePicks;
+
                   return (
                     <div key={site} className="space-y-2">
-                        <h3 className="text-xs font-semibold text-neutral-400">{site} Classic Picks</h3>
-                        <div className="bg-neutral-950 rounded border border-neutral-800 overflow-hidden text-[11px]">
-                            {picksList.length > 0 ? (
-                              picksList.map((p, i) => (
-                                <div key={i} className="flex justify-between items-center py-1.5 px-3 border-b border-neutral-800/60 last:border-0">
-                                    <div className="flex items-center gap-2">
-                                        <span className="text-neutral-500 w-4 font-mono">{i+1}</span>
-                                        <span className="text-white font-medium">{p.name}</span>
-                                        <span className="text-neutral-500 text-[10px]">({p.team})</span>
-                                    </div>
-                                    <div className="flex items-center gap-2">
-                                        <span className="text-orange-400 font-bold">{p.value.toFixed(2)}x</span>
-                                        <span className="text-neutral-500 text-[10px] bg-neutral-900 px-1.5 py-0.5 rounded">{p.reason}</span>
-                                    </div>
+                      <div className="flex items-center justify-between">
+                        <h3 className="text-xs font-semibold text-neutral-300">
+                          {isDK ? 'DraftKings Classic Picks' : 'FanDuel Classic Picks'}
+                        </h3>
+                        <span className="text-[10px] text-neutral-500 font-mono">
+                          {isDK ? 'Official DraftKings Salaries' : Object.keys(fdSalariesMap).length > 0 ? 'Uploaded FanDuel Salaries' : 'Awaiting CSV'}
+                        </span>
+                      </div>
+
+                      <div className="bg-neutral-950 rounded border border-neutral-800 overflow-hidden text-[11px]">
+                        {picksList.length > 0 ? (
+                          picksList.map((p, i) => (
+                            <div
+                              key={p.id || i}
+                              className="flex items-center justify-between py-2 px-3 border-b border-neutral-800/60 last:border-0 hover:bg-neutral-900/30 transition-colors"
+                            >
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <span className="text-neutral-500 w-4 font-mono text-[10px] shrink-0 text-right">
+                                  {i + 1}
+                                </span>
+                                <div className="truncate">
+                                  <div className="text-white font-medium truncate flex items-center gap-1.5">
+                                    <span>{p.name}</span>
+                                    <span className="text-neutral-400 text-[10px] font-normal">({p.team})</span>
+                                  </div>
+                                  <div className="text-[10px] text-neutral-400 flex items-center gap-1.5 mt-0.5">
+                                    <span className="text-neutral-300 font-medium">{p.gameTime || 'Tonight'}</span>
+                                    <span className="text-neutral-600">·</span>
+                                    <span className="text-neutral-300 font-mono font-medium">${p.salary ? p.salary.toLocaleString() : '-'}</span>
+                                    <span className="text-neutral-600">·</span>
+                                    <span className="text-neutral-300 font-mono">{p.projectedFp ? p.projectedFp.toFixed(1) : '-'} FP</span>
+                                  </div>
                                 </div>
-                              ))
-                            ) : (
-                              <div className="py-3 text-center text-neutral-500 text-[11px]">
-                                Upload FanDuel salaries to populate picks
                               </div>
-                            )}
-                        </div>
+
+                              <div className="flex items-center gap-2 shrink-0 ml-2">
+                                <span className="text-orange-400 font-bold font-mono text-xs">
+                                  {p.value.toFixed(2)}x
+                                </span>
+                                <span className="text-neutral-400 text-[10px] bg-neutral-900 px-1.5 py-0.5 rounded border border-neutral-800">
+                                  {p.reason}
+                                </span>
+                              </div>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="py-8 text-center text-neutral-500 text-xs">
+                            {isDK
+                              ? 'DraftKings data unavailable'
+                              : 'Upload FanDuel salaries to populate picks'}
+                          </div>
+                        )}
+                      </div>
                     </div>
                   );
                 })}
