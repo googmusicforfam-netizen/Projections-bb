@@ -13,6 +13,7 @@ export const db = firebaseConfig.firestoreDatabaseId
 
 export interface SavedFanDuelData {
   salaries: Record<string, number>;
+  positions?: Record<string, string>; // Map of normalized player name to eligible positions (e.g. "PG, SG")
   uploadDate: string; // e.g., "Saturday, March 7, 2026, 6:04 PM"
   timestamp: number; // Unix timestamp ms
   matchedCount: number;
@@ -23,7 +24,7 @@ const FD_SALARIES_COLLECTION = 'fanduel_salaries';
 const FD_SALARIES_DOC_ID = 'latest';
 
 /**
- * Saves uploaded FanDuel salaries to Firestore
+ * Saves uploaded FanDuel salaries and positions to Firestore
  */
 export async function saveFanDuelSalariesToCloud(data: SavedFanDuelData): Promise<void> {
   const docRef = doc(db, FD_SALARIES_COLLECTION, FD_SALARIES_DOC_ID);
@@ -31,7 +32,7 @@ export async function saveFanDuelSalariesToCloud(data: SavedFanDuelData): Promis
 }
 
 /**
- * Fetches the latest FanDuel salaries from Firestore
+ * Fetches the latest FanDuel salaries and positions from Firestore
  */
 export async function getFanDuelSalariesFromCloud(): Promise<SavedFanDuelData | null> {
   try {
@@ -47,7 +48,7 @@ export async function getFanDuelSalariesFromCloud(): Promise<SavedFanDuelData | 
 }
 
 /**
- * Subscribes to real-time updates for latest FanDuel salaries from Firestore
+ * Subscribes to real-time updates for latest FanDuel salaries and positions from Firestore
  */
 export function subscribeToFanDuelSalaries(callback: (data: SavedFanDuelData | null) => void): () => void {
   try {

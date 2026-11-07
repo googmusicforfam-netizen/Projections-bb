@@ -43,6 +43,7 @@ interface HotPlayer {
   team: string;
   opponent: string;
   position: string;
+  dkPosition?: string;
   avgFp: number;
   g1: GamePerformance;
   g2: GamePerformance;
@@ -58,6 +59,7 @@ interface ValuePick {
   id?: string;
   name: string;
   team: string;
+  position?: string;
   salary: number;
   projectedFp: number;
   value: number;
@@ -74,6 +76,16 @@ interface NbaApiResponse {
   hotPlayers: HotPlayer[];
   dkValuePicks: ValuePick[];
   fdValuePicks: ValuePick[];
+}
+
+// Clean and normalize multi-positions (e.g., "PG/SG" -> "PG, SG", "SF,PF,C" -> "SF, PF, C")
+function cleanPositions(raw: string | undefined | null): string {
+  if (!raw) return '';
+  return raw
+    .split(/[\/,]/)
+    .map(p => p.trim().toUpperCase())
+    .filter(Boolean)
+    .join(', ');
 }
 
 // Normalize player names to ignore accents, periods, junior/senior, roman numerals, and special characters
@@ -147,7 +159,7 @@ function parseFanDuelCSV(text: string): ParsedFanDuelPlayer[] {
   const lastCol = findColIndex(['last name', 'lastname', 'last']);
   const salCol = findColIndex(['salary', 'salary ($)', 'sal', 'cost', 'price']);
   const teamCol = findColIndex(['team', 'team abbreviation', 'teamabbrev', 'tm']);
-  const posCol = findColIndex(['position', 'pos', 'roster position']);
+  const posCol = findColIndex(['position', 'pos', 'roster position', 'eligible positions', 'positions']);
 
   if (salCol === -1) {
     throw new Error('Could not find Salary column in CSV.');
@@ -170,7 +182,8 @@ function parseFanDuelCSV(text: string): ParsedFanDuelPlayer[] {
     const rawSal = vals[salCol] || '';
     const salary = parseInt(rawSal.replace(/[^0-9]/g, ''), 10);
     const team = teamCol !== -1 ? vals[teamCol] : '';
-    const position = posCol !== -1 ? vals[posCol] : '';
+    const rawPos = posCol !== -1 ? vals[posCol] : '';
+    const position = cleanPositions(rawPos);
 
     if (name && !isNaN(salary) && salary > 0) {
       players.push({ name, salary, team, position });
@@ -199,6 +212,18 @@ export default function App() {
       if (saved) {
         const parsed = JSON.parse(saved);
         return parsed.salaries || {};
+      }
+    } catch (e) {}
+    return {};
+  });
+
+  // Persistent FanDuel positions map (e.g., "PG, SG")
+  const [fdPositionsMap, setFdPositionsMap] = useState<Record<string, string>>(() => {
+    try {
+      const saved = localStorage.getItem('nba_fd_salaries_cache');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return parsed.positions || {};
       }
     } catch (e) {}
     return {};
@@ -274,6 +299,9 @@ export default function App() {
       if (!isMounted || !cloudData) return;
       if (cloudData.salaries && Object.keys(cloudData.salaries).length > 0) {
         setFdSalariesMap(cloudData.salaries);
+        if (cloudData.positions) {
+          setFdPositionsMap(cloudData.positions);
+        }
         const info = formatUploadInfo(
           cloudData.uploadDate,
           cloudData.timestamp,
@@ -294,6 +322,9 @@ export default function App() {
         if (cloudData && cloudData.salaries && Object.keys(cloudData.salaries).length > 0) {
           if (!isMounted) return;
           setFdSalariesMap(cloudData.salaries);
+          if (cloudData.positions) {
+            setFdPositionsMap(cloudData.positions);
+          }
           setFdUploadInfo(formatUploadInfo(
             cloudData.uploadDate,
             cloudData.timestamp,
@@ -316,6 +347,9 @@ export default function App() {
           const srvData = await res.json();
           if (srvData && srvData.salaries && Object.keys(srvData.salaries).length > 0 && isMounted) {
             setFdSalariesMap(srvData.salaries);
+            if (srvData.positions) {
+              setFdPositionsMap(srvData.positions);
+            }
             setFdUploadInfo(formatUploadInfo(
               srvData.uploadDate,
               srvData.timestamp,
@@ -356,7 +390,8 @@ export default function App() {
         }
 
         const parsedPlayers = parseFanDuelCSV(text);
-        const newMap: Record<string, number> = { ...fdSalariesMap };
+        const newSalaryMap: Record<string, number> = { ...fdSalariesMap };
+        const newPosMap: Record<string, string> = { ...fdPositionsMap };
         const unmatchedList: string[] = [];
         let matched = 0;
 
@@ -364,7 +399,10 @@ export default function App() {
 
         parsedPlayers.forEach(p => {
           const normKey = normalizePlayerName(p.name);
-          newMap[normKey] = p.salary;
+          newSalaryMap[normKey] = p.salary;
+          if (p.position) {
+            newPosMap[normKey] = p.position;
+          }
 
           if (currentActiveNames.has(normKey)) {
             matched++;
@@ -390,7 +428,8 @@ export default function App() {
         const currentTimestamp = Date.now();
 
         const uploadMetadata: SavedFanDuelData = {
-          salaries: newMap,
+          salaries: newSalaryMap,
+          positions: newPosMap,
           uploadDate: fullUploadDateStr,
           timestamp: currentTimestamp,
           matchedCount: matched,
@@ -398,7 +437,8 @@ export default function App() {
         };
 
         // Update local state immediately
-        setFdSalariesMap(newMap);
+        setFdSalariesMap(newSalaryMap);
+        setFdPositionsMap(newPosMap);
         setFdUploadInfo(formatUploadInfo(
           fullUploadDateStr,
           currentTimestamp,
@@ -485,23 +525,28 @@ export default function App() {
 
     return processedHotPlayers
       .filter(p => p.fdSalary !== null && p.fdSalary > 0)
-      .map(p => ({
-        id: p.id,
-        name: p.name,
-        team: p.team,
-        salary: p.fdSalary!,
-        projectedFp: p.avgFp,
-        value: p.avgFp / (p.fdSalary! / 1000),
-        gameTime: teamGameMap.get(p.team) || 'Tonight',
-        reason: p.driverTeammate && p.driverStatusTonight === 'ruled_out'
-          ? 'Injury Beneficiary'
-          : p.avgFp >= 35
-          ? 'Soft Matchup'
-          : 'Value Play'
-      }))
+      .map(p => {
+        const norm = normalizePlayerName(p.name);
+        const fdPos = fdPositionsMap[norm] || p.position;
+        return {
+          id: p.id,
+          name: p.name,
+          team: p.team,
+          position: fdPos,
+          salary: p.fdSalary!,
+          projectedFp: p.avgFp,
+          value: p.avgFp / (p.fdSalary! / 1000),
+          gameTime: teamGameMap.get(p.team) || 'Tonight',
+          reason: p.driverTeammate && p.driverStatusTonight === 'ruled_out'
+            ? 'Injury Beneficiary'
+            : p.avgFp >= 35
+            ? 'Soft Matchup'
+            : 'Value Play'
+        };
+      })
       .sort((a, b) => b.value - a.value)
       .slice(0, 20);
-  }, [processedHotPlayers, fdSalariesMap, data?.games]);
+  }, [processedHotPlayers, fdSalariesMap, fdPositionsMap, data?.games]);
 
   const sortedHotPlayers = useMemo(() => {
     if (!processedHotPlayers.length) return [];
@@ -641,7 +686,7 @@ export default function App() {
                                 </span>
                                 <div className="truncate">
                                   <div className="text-white font-medium truncate flex items-center gap-1.5">
-                                    <span>{p.name}</span>
+                                    <span>{p.name}{p.position ? (', ' + p.position) : ''}</span>
                                     <span className="text-neutral-400 text-[10px] font-normal">({p.team})</span>
                                   </div>
                                   <div className="text-[10px] text-neutral-400 flex items-center gap-1.5 mt-0.5">
@@ -687,7 +732,7 @@ export default function App() {
                     <div className="font-bold text-white text-xs mb-1.5">{teamGroup.team}</div>
                     {teamGroup.players.map((p, idx) => (
                       <div key={idx} className="flex justify-between text-[11px] py-0.5">
-                        <span className="text-neutral-300">{p.name}</span>
+                        <span className="text-neutral-300">{p.name}{p.position ? (', ' + p.position) : ''}</span>
                         <span className="text-rose-400 font-bold">{p.status}</span>
                       </div>
                     ))}
@@ -778,7 +823,7 @@ export default function App() {
                       return (
                         <tr key={p.id} className={`${p.targetStatus === 'prime_target' ? 'bg-orange-500/[0.03]' : ''}`}>
                           <td className="py-2.5 px-3">
-                            <span className="font-semibold text-white">{p.name}</span>
+                            <span className="font-semibold text-white">{p.name}{p.position ? (', ' + p.position) : ''}</span>
                             {p.targetStatus === 'prime_target' && <span className="ml-2 text-[10px] text-orange-400 font-bold">PRIME TARGET</span>}
                             {p.targetStatus === 'fade_risk' && <span className="ml-2 text-[10px] text-rose-400 font-bold">FADE RISK</span>}
                           </td>

@@ -32,9 +32,23 @@ let cache: {
   data: any;
 } | null = null;
 
-// Pull DraftKings Classic Salaries
-async function fetchDraftKingsSalaries(): Promise<Map<string, number>> {
-  const salaryMap = new Map<string, number>();
+// Pull DraftKings Classic Salaries and Positions
+interface DkPlayerInfo {
+  salary: number;
+  position: string;
+}
+
+function cleanPositions(raw: string | undefined): string {
+  if (!raw) return '';
+  return raw
+    .split(/[\/,]/)
+    .map(p => p.trim().toUpperCase())
+    .filter(Boolean)
+    .join(', ');
+}
+
+async function fetchDraftKingsData(): Promise<Map<string, DkPlayerInfo>> {
+  const playerMap = new Map<string, DkPlayerInfo>();
   const DK_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'application/json'
@@ -44,7 +58,7 @@ async function fetchDraftKingsSalaries(): Promise<Map<string, number>> {
     const lobbyRes = await fetch('https://www.draftkings.com/lobby/getcontests?sport=NBA', {
       headers: DK_HEADERS
     });
-    if (!lobbyRes.ok) return salaryMap;
+    if (!lobbyRes.ok) return playerMap;
     const lobbyData = await lobbyRes.json();
 
     const slates = (lobbyData.DraftGroups || []).filter((dg: any) => {
@@ -75,17 +89,20 @@ async function fetchDraftKingsSalaries(): Promise<Map<string, number>> {
           const fullName = `${p.fn || ''} ${p.ln || ''}`.trim();
           if (fullName && p.s) {
             const key = normalizeName(fullName);
-            if (!salaryMap.has(key)) {
-              salaryMap.set(key, p.s);
+            const posClean = cleanPositions(p.pn || '');
+            if (!playerMap.has(key)) {
+              playerMap.set(key, { salary: p.s, position: posClean });
+            } else if (posClean && !playerMap.get(key)!.position) {
+              playerMap.get(key)!.position = posClean;
             }
           }
         });
       }
     });
   } catch (err) {
-    console.warn('Could not auto-fetch DraftKings salaries:', err);
+    console.warn('Could not auto-fetch DraftKings data:', err);
   }
-  return salaryMap;
+  return playerMap;
 }
 
 // Pull FanDuel Classic Salaries
@@ -240,7 +257,45 @@ async function fetchNbaData(clientLocalDateStr: string) {
   });
 
 
-  // 4. Build Availability Panel Data: out, doubtful, or questionable for tonight's games, grouped by team
+  // 4. Fetch DraftKings, rosters, schedules and FanDuel salaries in parallel
+  const rosterPromises = teamsPlaying.map(async (t) => {
+    try {
+      const rRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${t.id}/roster`);
+      if (rRes.ok) {
+        const rData = await rRes.json();
+        return {
+          team: t.teamName,
+          opponent: t.opponent,
+          athletes: rData.athletes || []
+        };
+      }
+    } catch (e) {
+      console.warn(`Failed to fetch roster for ${t.teamName}:`, e);
+    }
+    return { team: t.teamName, opponent: t.opponent, athletes: [] };
+  });
+
+  const schedulePromises = teamsPlaying.map(async (t) => {
+    try {
+      const sRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${t.id}/schedule`);
+      if (sRes.ok) {
+        const sData = await sRes.json();
+        const completed = (sData.events || []).filter((e: any) => e.competitions?.[0]?.status?.type?.completed);
+        const last2 = completed.slice(-2);
+        return { team: t.teamName, last2GameIds: last2.map((g: any) => g.id) };
+      }
+    } catch (e) {}
+    return { team: t.teamName, last2GameIds: [] };
+  });
+
+  const [rosterResults, schedules, dkDataMap, fdSalariesMap] = await Promise.all([
+    Promise.all(rosterPromises),
+    Promise.all(schedulePromises),
+    fetchDraftKingsData(),
+    fetchFanDuelSalaries()
+  ]);
+
+  // 5. Build Availability Panel Data: out, doubtful, or questionable for tonight's games, grouped by team
   const availabilityByTeam: Array<{
     team: string;
     players: Array<{ name: string; position: string; status: string; detail: string }>;
@@ -269,9 +324,14 @@ async function fetchNbaData(clientLocalDateStr: string) {
           else if (s.includes('doubtful')) cleanStatus = 'Doubtful';
           else if (s.includes('questionable') || s.includes('day-to-day') || s.includes('gtd')) cleanStatus = 'Questionable';
 
+          const athleteName = inj.athlete?.displayName || 'Unknown Player';
+          const athleteNorm = normalizeName(athleteName);
+          const dkPos = dkDataMap.get(athleteNorm)?.position;
+          const posClean = dkPos || cleanPositions(inj.athlete?.position?.abbreviation) || 'G';
+
           return {
-            name: inj.athlete?.displayName || 'Unknown Player',
-            position: inj.athlete?.position?.abbreviation || 'G/F',
+            name: athleteName,
+            position: posClean,
             status: cleanStatus,
             detail: inj.details?.type || inj.shortComment || 'Injury'
           };
@@ -279,45 +339,6 @@ async function fetchNbaData(clientLocalDateStr: string) {
       });
     }
   }
-
-  // 5. Fetch official team rosters & recent game logs for last 2 games
-  const rosterPromises = teamsPlaying.map(async (t) => {
-    try {
-      const rRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${t.id}/roster`);
-      if (rRes.ok) {
-        const rData = await rRes.json();
-        return {
-          team: t.teamName,
-          opponent: t.opponent,
-          athletes: rData.athletes || []
-        };
-      }
-    } catch (e) {
-      console.warn(`Failed to fetch roster for ${t.teamName}:`, e);
-    }
-    return { team: t.teamName, opponent: t.opponent, athletes: [] };
-  });
-
-  // Fetch recent game schedules for all teams to identify completed last 2 games
-  const schedulePromises = teamsPlaying.map(async (t) => {
-    try {
-      const sRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${t.id}/schedule`);
-      if (sRes.ok) {
-        const sData = await sRes.json();
-        const completed = (sData.events || []).filter((e: any) => e.competitions?.[0]?.status?.type?.completed);
-        const last2 = completed.slice(-2);
-        return { team: t.teamName, last2GameIds: last2.map((g: any) => g.id) };
-      }
-    } catch (e) {}
-    return { team: t.teamName, last2GameIds: [] };
-  });
-
-  const [rosterResults, schedules, dkSalariesMap, fdSalariesMap] = await Promise.all([
-    Promise.all(rosterPromises),
-    Promise.all(schedulePromises),
-    fetchDraftKingsSalaries(),
-    fetchFanDuelSalaries()
-  ]);
 
   // Collect unique game IDs for last 2 games across all teams
   const allRecentGameIds = Array.from(new Set(schedules.flatMap((s) => s.last2GameIds)));
@@ -436,12 +457,12 @@ async function fetchNbaData(clientLocalDateStr: string) {
       if (processedPlayerNames.has(lowerName)) continue;
       processedPlayerNames.add(lowerName);
 
-      const pos = athlete.position?.abbreviation || 'G';
       const normKey = normalizeName(name);
-
-      // Real salaries only (dash if not found)
-      const dkSalary = dkSalariesMap.has(normKey) ? (dkSalariesMap.get(normKey) as number) : null;
+      const dkInfo = dkDataMap.get(normKey);
+      const dkSalary = dkInfo ? dkInfo.salary : null;
+      const dkPosition = dkInfo?.position || cleanPositions(athlete.position?.abbreviation) || 'G';
       const fdSalary = fdSalariesMap.has(normKey) ? (fdSalariesMap.get(normKey) as number) : null;
+      const pos = dkPosition; // Base position for general displays
 
       // Retrieve last 2 games
       const games = playerGamesMap.get(name) || [];
@@ -529,6 +550,7 @@ async function fetchNbaData(clientLocalDateStr: string) {
         team: teamName,
         opponent: teamRoster.opponent,
         position: pos,
+        dkPosition,
         avgFp,
         g1: { fp: Math.round(g1Fp * 10) / 10, min: g1Min },
         g2: { fp: Math.round(g2Fp * 10) / 10, min: g2Min },
@@ -551,6 +573,7 @@ async function fetchNbaData(clientLocalDateStr: string) {
         id: p.id,
         name: p.name,
         team: p.team,
+        position: p.dkPosition || p.position,
         salary: p.dkSalary!,
         projectedFp: p.avgFp,
         value: p.avgFp / (p.dkSalary! / 1000),

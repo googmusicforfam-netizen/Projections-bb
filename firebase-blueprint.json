@@ -2,12 +2,16 @@
   "entities": {
     "fanduel_salaries": {
       "title": "FanDuel Salaries",
-      "description": "Shared FanDuel player salaries, upload timestamps, and matching stats",
+      "description": "Shared FanDuel player salaries, positions, upload timestamps, and matching stats",
       "type": "object",
       "properties": {
         "salaries": {
           "type": "object",
-          "description": "Map of player normalized or display name to salary in dollars"
+          "description": "Map of player normalized name to salary in dollars"
+        },
+        "positions": {
+          "type": "object",
+          "description": "Map of player normalized name to eligible positions (e.g., PG, SG)"
         },
         "uploadDate": {
           "type": "string",
